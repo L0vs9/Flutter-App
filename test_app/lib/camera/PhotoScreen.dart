@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
-import 'dart:math';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -15,6 +14,7 @@ import 'package:latlong2/latlong.dart';
 import 'package:vpn_info/vpn_info.dart';
 import 'package:flutter_map_location_marker/flutter_map_location_marker.dart';
 import 'package:flutter/foundation.dart';
+import 'dart:math';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -52,7 +52,7 @@ class _PhotoScreenState extends State<PhotoScreen> {
   CameraController? controller;
   bool isCapturing = false;
   Timer? _timer;
-  Timer? _locationTimer; // Timer for periodic location updates
+  Timer? _locationTimer;
   final String topicNameProducer = 'test-pictures-flutter';
   late String topicNameConsumer;
   KafkaSession? session;
@@ -62,7 +62,7 @@ class _PhotoScreenState extends State<PhotoScreen> {
   SendPort? isolateSendPort;
   double speed = 0.0;
   double heading = 0.0;
-  LatLng currentLocation = LatLng(46.554649, 15.645881); // Initial location
+  LatLng currentLocation = LatLng(46.554649, 15.645881);
   LatLng? selectedLocation;
   StreamSubscription<Position>? _positionStreamSubscription;
   bool _isStreaming = false;
@@ -79,6 +79,8 @@ class _PhotoScreenState extends State<PhotoScreen> {
   List<String> previousTrafficSigns = [];
   double widthCircle = 0;
   List<Marker> trafficSignMarkers = [];
+  int frameCounter = 0;
+  Map<String, LatLng> receivedTrafficSigns = {};
 
   @override
   void initState() {
@@ -138,18 +140,35 @@ class _PhotoScreenState extends State<PhotoScreen> {
         final signImage = AssetImage("assets/${sign}.png");
         final newSignLocation = _calculateNewSignLocation();
 
-        trafficSignMarkers.add(
-          Marker(
-            width: 30.0,
-            height: 30.0,
-            point: newSignLocation,
-            builder: (ctx) => Container(
-              child: Image(image: signImage),
+        if (!_isSignInRadius(sign, newSignLocation)) {
+          trafficSignMarkers.add(
+            Marker(
+              width: 30.0,
+              height: 30.0,
+              point: newSignLocation,
+              builder: (ctx) => Container(
+                child: Image(image: signImage),
+              ),
             ),
-          ),
-        );
+          );
+          receivedTrafficSigns[sign] = newSignLocation;
+        }
       }
     }
+  }
+
+  bool _isSignInRadius(String sign, LatLng location) {
+    if (receivedTrafficSigns.containsKey(sign)) {
+      final existingLocation = receivedTrafficSigns[sign]!;
+      final distance = Geolocator.distanceBetween(
+        existingLocation.latitude,
+        existingLocation.longitude,
+        location.latitude,
+        location.longitude,
+      );
+      return distance < 10.0;
+    }
+    return false;
   }
 
   LatLng _calculateNewSignLocation() {
@@ -212,8 +231,10 @@ class _PhotoScreenState extends State<PhotoScreen> {
     if (!_isStreaming && controller != null && controller!.value.isInitialized) {
       _isStreaming = true;
       controller!.startImageStream((CameraImage image) {
-        if (isCapturing) {
+        frameCounter++;
+        if (isCapturing && frameCounter % 30 == 0) {
           _processCameraImage(image);
+          frameCounter = 0;
         }
       });
     }
@@ -281,8 +302,8 @@ class _PhotoScreenState extends State<PhotoScreen> {
       }
     }
 
-    final img.Image resizedImage = img.copyResize(imgImage, width: 640);
-    return Uint8List.fromList(img.encodeJpg(resizedImage, quality: 50));
+    final img.Image resizedImage = img.copyResize(imgImage, width: 1080);
+    return Uint8List.fromList(img.encodeJpg(resizedImage, quality: 90)); // v bistvu, če je 100 nič ne compresa
   }
 
   void _processCameraImage(CameraImage image) async {
@@ -294,8 +315,9 @@ class _PhotoScreenState extends State<PhotoScreen> {
     isolateSendPort?.send([image, responsePort.sendPort]);
 
     final Uint8List compressedImage = await responsePort.first;
-    _showPopupImage(compressedImage);
     await sendImageToKafka(compressedImage);
+
+    compressedImage.clear();
 
     await Future.delayed(Duration(seconds: 0));
     if (isCapturing) {
@@ -338,15 +360,21 @@ class _PhotoScreenState extends State<PhotoScreen> {
         [kafkaMessage],
       );
 
-      var result = await producer!.produce([envelope]);
-
-      if (result.errors.isNotEmpty) {
-        _showError("Error sending image to Kafka: ${result.errors}");
-      } else {
-        print("Image sent to Kafka.");
-      }
+      // Handle the produce operation asynchronously
+      producer!.produce([envelope]).then((result) {
+        print(result.hasRetriableErrors);
+        if (result.errors.isNotEmpty) {
+          _showError("Error sending image to Kafka: ${result.errors}");
+        } else {
+          print("Image sent to Kafka.");
+        }
+      }).catchError((e) {
+        _showError("Exception sending image to Kafka: $e");
+      }).whenComplete(() {
+        // Complete the completer to allow the next send operation
+      });
     } catch (e) {
-      _showError("Exception sending image to Kafka: $e");
+      _showError("Exception preparing image for Kafka: $e");
     }
   }
 
@@ -395,58 +423,64 @@ class _PhotoScreenState extends State<PhotoScreen> {
     var group = ConsumerGroup(session!, 'myConsumerGroup');
     var topics = {topicNameConsumer: {0}};
 
-    consumer = Consumer(session!, group, topics, 100, 1);
-    _consumerSubscription = consumer!.consume().listen((MessageEnvelope envelope) {
-      try {
-        var jsonString = String.fromCharCodes(envelope.message.value);
+    try {
+      consumer = Consumer(session!, group, topics, 100, 1);
+      _consumerSubscription = consumer!.consume().listen((MessageEnvelope envelope) {
+        try {
+          var jsonString = String.fromCharCodes(envelope.message.value);
 
-        var data = jsonDecode(jsonString);
+          var data = jsonDecode(jsonString);
 
-        String datetime = data['DateTime'];
-        String result = data['Result'];
+          String datetime = data['DateTime'];
+          String result = data['Result'];
 
-        setState(() {
-          // Ensure result is treated as a list
-          List<String> results = result.contains(',') ? result.split(',') : [result];
-          trafficSignsToShow = results.map((r) {
-            return trafficSigns.keys.firstWhere(
-                  (key) => trafficSigns[key].toString() == r.trim(),
-              orElse: () => "unknown",
-            );
-          }).toList();
-        });
+          setState(() {
+            List<String> results = result.contains(',') ? result.split(',') : [result];
+            trafficSignsToShow = results.map((r) {
+              return trafficSigns.keys.firstWhere(
+                    (key) => trafficSigns[key].toString() == r.trim(),
+                orElse: () => "unknown",
+              );
+            }).toList();
+          });
 
-        _updateTrafficSignMarkers();
+          _updateTrafficSignMarkers();
 
-        envelope.commit('metadata');
-      } catch (e) {
-        _showError("Error processing message: $e");
-      }
-    }, onError: (error) {
-      _showError("Error consuming message: $error");
-    });
+          envelope.commit('metadata');
+        } catch (e) {
+          _showError("Error processing message: $e");
+          print("Error processing message: $e");
+        }
+      }, onError: (error) {
+        _showError("Error consuming message: $error");
+        print("Error consuming message: $error");
+      });
+    } catch (e) {
+      _showError("Failed to start Kafka consumer: $e");
+      print("Failed to start Kafka consumer: $e");
+    }
   }
 
   Future<String?> getConnectedVpnAddresses() async {
-      try {
-        final networkInterfaces = await NetworkInterface.list(
-          includeLoopback: false,
-          type: InternetAddressType.any,
-        );
+    try {
+      final networkInterfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.any,
+      );
 
-        final vpnPatterns = ["tun", "tap", "ppp", "pptp", "l2tp", "ipsec", "vpn"];
-        for (var interface in networkInterfaces) {
-          if (vpnPatterns.any((pattern) => interface.name.toLowerCase().contains(pattern))) {
-            if (interface.addresses.isNotEmpty) {
-              return interface.addresses.first.address;
-            }
+      final vpnPatterns = ["tun", "tap", "ppp", "pptp", "l2tp", "ipsec", "vpn"];
+      for (var interface in networkInterfaces) {
+        if (vpnPatterns.any((pattern) => interface.name.toLowerCase().contains(pattern))) {
+          if (interface.addresses.isNotEmpty) {
+            return interface.addresses.first.address;
           }
         }
-        return null;
-      } catch (e) {
-        print("Error getting VPN IP Address using NetworkInterface: $e");
-        return null;
       }
+      return null;
+    } catch (e) {
+      print("Error getting VPN IP Address using NetworkInterface: $e");
+      return null;
+    }
   }
 
   void _showPopup(String message) {
@@ -488,8 +522,6 @@ class _PhotoScreenState extends State<PhotoScreen> {
       },
     );
   }
-
-
 
   void _showError(String message) {
     final snackBar = SnackBar(
@@ -787,7 +819,6 @@ class ZoomControls extends StatelessWidget {
 
 
 
-/*
- - Dodaj Radius
- - Algo, ki placa znake nekaj metrov pred headingom v radius
- */
+
+
+
